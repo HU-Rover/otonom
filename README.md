@@ -260,23 +260,6 @@ For robots that encounter elevated surfaces (shelves, ramps):
 
 ---
 
-## 🗺️ Plugin Layers (Post-Processing Pipeline)
-
-Plugins run sequentially in `config/core/plugin_config.yaml` **after** sensor fusion but **before** publishing:
-
-```
-Raw GPU Map  →  min_filter  →  smooth  →  inpaint  →  erosion  →  Published grid layers
-```
-
-| Plugin | Function | Key Params |
-|--------|----------|------------|
-| `min_filter` | Fill invalid/nan cells with the **minimum** height in the dilation radius neighbourhood. Acts as a first-pass gap filler. | `dilation_size`, `iteration_n` |
-| `smooth_filter` | Simple smoothing (averaging) over the previous layer (`input_layer_name`). Reduces surface noise produced by point clouds with high variance. | — |
-| `inpainting` | OpenCV inpainting of remaining nan regions using either the `telea` or `ns` (Navier-Stokes) algorithm. Produces visually clean edges but adds CPU overhead. | `method: telea\|ns` |
-| `erosion` | Dilates traversability (or any selected layer) to smooth out small "islands" of unsafe value and widen safe corridors by the specified radius. Set `reverse=true` for a **closing** operation that shrinks traversable regions; use `false` for **opening** (expands them). | `dilation_size`, `iteration_n` |
-
----
-
 ## 📡 Key ROS2 Topics & Services
 
 | Topic / Service | Direction | Type | Purpose |
@@ -335,18 +318,6 @@ rviz2 ...   # Add plugins: NavPose, TF, Map (subscribe to /map), Path, LaserScan
 ### Nav2 + `corrected_map_frame`
 
 If you enable `enable_drift_corrected_TF_publishing`, Nav2 can optionally use the corrected frame for its global reference. Set `global_frame: <corrected_frame_name>` and `map_frame: <corrected_frame_name>` in your navigation params so that the localiser doesn't drift away from the costmap as odometry degrades over time.
-
----
-
-## 🔍 Tuning Quick-Reference
-
-| Condition | Parameter to Adjust | Direction |
-|-----------|-------------------|-----------|
-| Noisy / sparse sensor data | `sensor_noise_factor`, `mahalanobis_thresh` | ↑ both for stricter filtering |
-| Fast-moving rover, map "jumps" | `drift_compensation_alpha` | ↓ (e.g. 0.05) |
-| Near-field floor reflected by LiDAR under chassis | `ramped_height_range_b`, `min_valid_distance` | ↑ |
-| Nav2 costmap looks too noisy | Traverseability threshold in **costmap_converter** (`val < 0.3f → obstacle`) — increase the cutoff to e.g. `0.45`, or adjust `dilation_size` / plugin layers upstream | |
-| Map grows large during multi-floor operation | `enable_overlap_clearance`, `overlap_clear_range_*` | ↑ ranges if floors are far apart |
 
 ---
 
