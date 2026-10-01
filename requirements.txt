@@ -1,0 +1,30 @@
+# ============================================================
+# Otonom — Python dependencies
+# Install with: pip install -r requirements.txt
+# ============================================================
+
+# GPU-accelerated array library (match your CUDA version)
+# For CUDA 12.x:
+cupy-cuda12x>=13.0.0
+# If you have a different CUDA version, use one of these instead:
+# cupy-cuda11x   (CUDA 11.x)
+# cupy-cuda118   (CUDA 11.8 - legacy)
+
+# Core computation & array handling
+numpy<2.0            # numpy >= 2 changes memory layout and breaks CuPy interop
+scipy>=1.10
+shapely>=2.0
+ruamel.yaml>=0.17    # YAML config parsing
+simple-parsing       # Parameter/dataclass serialization (used by elevation_mapping)
+transforms3d         # Coordinate frame / quaternion transforms
+
+# Computer vision
+opencv-python>=4.8   # ArUco detection, image processing
+cv-bridge              # handled by ROS2 cv_bridge package — not installed via pip
+PyYAML               # additional YAML support if needed
+
+# RealSense camera
+pyrealsense2>=2.55.0  # Intel RealSense SDK Python bindings
+
+# Serial communication (motor control)
+pyserial>=3.5         # serial port access for STM32 / joystick hardware
