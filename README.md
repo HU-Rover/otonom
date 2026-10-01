@@ -1,338 +1,364 @@
 # Otonom — GPU-Accelerated 3D Elevation Mapping & Autonomous Navigation Stack
 
-A ROS2-based robot navigation system providing real-time 3D elevation mapping on GPU, wheel odometry estimation, motor/arm control, ArUco marker localization, and costmap conversion for Nav2 autonomous navigation.
+A ROS2-based robot navigation system providing real-time 3D elevation mapping on GPU, wheel odometry estimation, motor/arm control, costmap conversion (`GridMap → OccupancyGrid`), and full [Nav2](https://navigation.ros.org/) autonomous navigation stack for outdoor/indoor rover platforms equipped with a Unitree L2 LiDAR.
 
 ---
 
-## 🏗️ Architecture Overview
+## 🏗️ High-Level Architecture
 
 ```
-┌─────────────────┐     ┌──────────────────┐     ┌─────────────────────┐
-│ Unitree L2 LiDAR │     │ RealSense Camera │     │  RC Transmitter    │
-│   (PointCloud)   │     │ (RGB + Depth)    │     │   (Joystick)       │
-└─────────┬────────┘     └────────┬─────────┘     └──────────┬──────────┘
-          │                       │                           │
-          ▼                       ▼                           ▼
-┌─────────────────────────────────────────────┐              │
-│         elevation_mapping_cupy (GPU)        │              │
-│  ┌──────────┐  ┌──────────┐  ┌────────────┐│              │
-│  │ PointMap │→ │ Fusion   │→ │ Traversabl.││              │
-│  │ (CuPy)   │  │ & Semant.│  │ (Neural    ││              │
-│  └──────────┘  └──────────┘  └────────────┘│              │
-└──────────────────────┬──────────────────────┘              │
-                       │ GridMap (traversability layer)      │
-                       ▼                                     │
-           ┌───────────────────────┐                          │
-           │   costmap_converter    │←── Encoder Data ────────┘
-           │  GridMap → OccupancyGrid│    (motor_kontrol)
-           └───────────┬───────────┘
-                       │ /map (nav_msgs/OccupancyGrid)
-                       ▼
-              ┌────────────────┐
-              │     Nav2       │ ← Odometry (/odom/wheel)
-              │  Navigation    │ ← ArUco pose (if deployed)
-              └────────────────┘
+┌───────────────┐                        ┌──────────────────┐
+│  Unitree L2   │                        │ RC Transmitter  │
+│   (LiDAR)     │                        │  (Joystick)     │
+│ PointCloud     │                        │ ControllerMsg   │
+└───────┬───────┘                        └────────┬────────┘
+        │                                         │
+        ▼                                         ▼
+┌─────────────────────────────────────────────────────────────┐
+│                   elevation_mapping_cupy                    │
+│  GPU-accelerated sensor fusion, traversability,               │
+│  semantic layers. Input: PointCloud → Output: GridMap         │
+└──────────────────────────────┬──────────────────────────────┘
+                               │ /elevation_map_raw (GridMap)
+                               ▼
+                     costmap_converter
+           GridMap.traversability → OccupancyGrid (/map)
+                               │
+            ┌──────────────────┼──────────────────┐
+            ▼                  ▼                   ▼
+    ┌─────────────┐  ┌─────────────┐   ┌──────────────────┐
+    │ Nav2        │  │ Odometry    │   │ Robot Motors     │
+    │ (AMCL,      │←│ (/odom/wheel)│   │ (motor_kontrol)  │
+    │ Path/Foli-   │  │             │   │ serial → STM32   │
+    │ ng stack)   │  └─────────────┘   └──────────────────┘
+    └─────────────┘
 ```
+
+### Data Flow Summary
+
+1. **Unitree L2** publishes a point cloud (`/point_cloud`) at the LiDAR data rate (~10 Hz).
+2. **`elevation_mapping_cupy`** ingests the point cloud, updates an on-GPU elevation map with traversability and semantic layers, and publishes a `GridMap` (`/elevation_map_raw`).
+3. **`costmap_converter`** subscribes to the GridMap and publishes a `nav_msgs/OccupancyGrid` (`/map`) that feeds Nav2's navigation stack.
+4. **Nav2** computes global/local plans and velocity commands, while odometry (built from wheel encoders) closes the pose loop.
 
 ---
 
-## 📦 Modules
+## 📦 Package List
 
 | Directory | Type | Description |
 |-----------|------|-------------|
-| `elevation_mapping_cupy/` | ROS2 Package | GPU-accelerated real-time 3D elevation mapping core (Python/CuPy) |
+| `elevation_mapping_cupy/` | ROS2 Package | GPU-accelerated elevation mapping core (Python/CuPy) |
 | `unitree_lidar_ros2/` | ROS2 Package | C++ driver for the Unitree L2 LiDAR sensor |
-| `costmap_converter/` | ROS2 Package | C++ node converting GridMap → OccupancyGrid for Nav2 |
-| `motor_kontrol/` | ROS2 Package | Python motor controller / robotic arm / joystick nodes |
-| `odometry/` | ROS2 Package | Wheel odometry estimation from encoder + IMU fusion |
-| `cv/` | ROS2 Package | Computer vision: RealSense camera publisher & ArUco marker detection |
+| `costmap_converter/` | ROS2 Package | Converts GridMap→OccupancyGrid for Nav2 (`val < 0.3f → obstacle`) |
+| `motor_kontrol/` | ROS2 Package | Motor controller, robotic arm handler, and RC joystick receiver |
+| `odometry/` | ROS2 Package | Wheel odometry from encoder data + IMU orientation quaternions |
 
 ---
 
-## 🚀 Setup & Installation
+## 🚀 Building & Running
 
-### Prerequisites
+### 0. Prerequisites
 
 ```bash
-# OS: Ubuntu 22.04 (Jammy) with ROS2 Humble
+# Ubuntu 22.04 + ROS2 Humble desktop:
 sudo apt update
+sudo apt install -y ros-humble-desktop ros-humble-grid-map-ros \
+  ros-humble-grid-map-msgs ros-humble-elevation-map-msgs \
+  ros-humble-rviz2 ros-humble-tf2-ros ros-humble-tf-transformations \
+  ros-humble-message-filters ros-humble-geometry-msgs \
+  ros-humble-sensor-msgs ros-humble-nav-msgs ros-humble-control-tools \
+  ros-humble-image-transport ros-humble-camera-info-manager \
+  cmake build-essential libpcl-dev libboost-system-dev
 
-# Core ROS2 packages
-sudo apt install -y ros-humble-desktop ros-humble-cv-bridge ros-humble-rviz2 \
-  ros-humble-tf2-ros ros-humble-tf-transformations ros-humble-message-filters \
-  ros-humble-geometry-msgs ros-humble-sensor-msgs ros-humble-nav-msgs \
-  ros-hulse-grid-map ros-humble-elevation-map-msgs
-
-# Python dependencies
-pip3 install cupy-cuda12x numpy<2 scipy opencv-python simple-parsing shapely ruamel.yaml transforms3d pyrealsense2
-
-# C++ build tools
-sudo apt install -y cmake build-essential libpcl-dev libboost-system-dev
+# CUDA toolkit (≥12.0 for cupy-cuda12x) — verify with:
+nvcc --version
 ```
 
-### Build
+### 1. Workspace Build
 
 ```bash
-# Create ROS2 workspace
-mkdir -p ~/otonom_ws/src && cd ~/otonom_ws/src
-
 # Clone the repository (already here, symlink if needed)
-git clone <your-repo-url> otonom  # or cp/symlink existing repo
+git clone https://github.com/HU-Rover/otonom.git # or cp/symlink existing repo
 
-cd ~/otonom_ws
-source /opt/ros/humble/setup.bash
+cd ~/otonom
 
 # Build each package
-colcon build --packages-select elevation_mapping_cupy
-colcon build --packages-select unitree_lidar_ros2
-colcon build --packages-select costmap_converter
-colcon build --packages-select motor_kontrol
-colcon build --packages-select odometry
-colcon build --packages-select cv
+colcon build 
 
 # Source workspace
 source install/setup.bash
-
-### Python Dependencies
-```bash
-# Install package-level requirements (see requirements.txt for details)
-pip3 install -r otonom/requirements.txt
 ```
 
-> **⚠️ Note on `cupy-cuda12x`**: Listed in `requirements.txt` as-is, but match your actual CUDA version:
-> - **CUDA 12.x** → use `cupy-cuda12x` (default, already listed)
-> - **CUDA 11.x** → install `cupy-cuda11x` instead
-> - **CUDA 11.8** → install `cupy-cuda118`
+### 2. Python Dependencies
+
+See [`requirements.txt`](./requirements.txt) for a pip-compatible list.
+
+```bash
+pip3 install -r /home/omer/github/otonom/requirements.txt
+```
+
+> **⚠️ CUDA version:** Match `cupy-cudaNNx` to your installed toolkit (use `nvcc --version`).
 >
-> Verify with `nvcc --version` and replace the package name accordingly.
->
-> > **⚠️ Note on `numpy<2.0`**: Pinned because CuPy interop breaks on numpy ≥ 2. This was already enforced in your ROS2 package.xml as `numpy_lessthan_2`. Use this pip requirement file instead of system `numpy`.
-```
+> **⚠️ `numpy<2.0`:** Pinned because CuPy interop breaks at ≥ 2 — already declared in the ROS package.xml as `numpy_lessthan_2`.
 
----
-
-## ▶️ Running the System
-
-### Option A — Full Simulation (Gazebo + TurtleBot3)
+### 3. Running on a Real Rover
 
 ```bash
-# Terminal 1: Launch Gazebo world with turtlebot3
-export TURTLEBOT3_MODEL=waffle_relescope_depth
-ros2 launch turtlebot3_gazebo turtlebot3_world.launch.py
-
-# Terminal 2: Launch elevation mapping + RViz
-ros2 launch elevation_mapping_cupy elevation_mapping_turtle.launch.py use_sim_time:=true
-```
-
-### Option B — Real Robot Deployment
-
-**Terminal 1 — LiDAR driver:**
-```bash
+# Terminal 1 — LiDAR
 source ~/otonom_ws/install/setup.bash
 ros2 launch unitree_lidar_ros2 launch.py
-```
 
-**Terminal 2 — Motor control + joystick:**
-```bash
-ros2 run motor_kontrol motor          # Motors & encoder reading (60 Hz)
-ros2 run motor_kontrol robot_kol      # Robotic arm control (mode=2)
-ros2 run motor_kontrol uzaktan_kumanda  # RC receiver → /joystick_cmd
-```
+# Terminal 2 — Motor controller + encoder reader (60 Hz)
+ros2 run motor_kontrol motor
 
-**Terminal 3 — Odometry:**
-```bash
+# Terminal 3 — Wheel odometry → /odom/wheel
 ros2 run odometry odom
-```
 
-**Terminal 4 — Camera & ArUco localization:**
-```bash
-# (Optional) ArUco camera node for marker-based localization:
-ros2 run cv cam_node
-```
-
-**Terminal 5 — Costmap converter & RViz:**
-```bash
-# Start the costmap converter (feeds Nav2):
+# Terminal 4 — Costmap converter → /map
 ros2 run costmap_converter grid_map_to_costmap
 
-# Start RViz for visualization:
-rviz2 -d ~/otonom_ws/src/otonom/costmap_converter/rviz/view.rviz
+# Terminal 5 — Nav2
+ros2 launch nav2_bringup navigation.launch.py
 ```
+
+> To drive manually during testing, `ros2 run motor_kontrol uzaktan_kumanda` listens to the RC receiver (`/dev/ttyUSB0`) and publishes joystick commands to the `motor` node. For robotic-arm handling, `ros2 run motor_kontrol robot_kol` forwards mode-2 servo/gripper commands via serial.
+
+> To visualize, launch RViz with a layout that adds `GridMap`, `OccupancyGrid`, `Odometry`, and Nav2 RViz plugins (e.g., `rviz2 -d /home/omer/github/otonom/costmap_converter/rviz/view.rviz`).
 
 ---
 
-## 🔧 Elevation Mapping Parameters — Detailed Guide
+## 🔧 Elevation Mapping — In-Depth Parameter Reference
 
-Core parameters are in `elevation_mapping_cupy/config/core/core_param.yaml`. They are grouped into functional categories below.
+Core parameters live in `config/core/core_param.yaml`. Each section below explains the purpose, a recommended tuning range, and what to watch for when you change it.
 
-### 1. Map Geometry & Resolution
+### 1. Map Geometry
 
-| Parameter | Default | Description |
-|-----------|---------|-------------|
-| `resolution` | `0.5` m | Cell edge length (m). Lower = higher detail but more GPU memory. Your robot uses **0.5 m**. This gives a `(map_length/resolution)²` grid — e.g., 20×20 for a 10 m map. |
-| `map_length` | `10.0` m | Physical extent of the map in each direction (X and Y) from center. A 10 m map with 0.5 m resolution = **20×20 cells**. Larger maps need more GPU memory (~3× per axis). |
+| Parameter | Default | Notes |
+|-----------|---------|------|
+| `resolution` | `0.5` m | Cell edge length in metres. Grid size = `(map_length / resolution)²`. Your rover uses **0.5**, giving a 20×20 grid for a 10 m map. Lower → more detail but **quadratic** memory/compute increase. |
+| `map_length` | `10.0` m | Full width/height of the map in each direction from centre. Smaller maps save GPU memory at the cost of frequent "edge-of-map" clipping during fast travel. |
 
-> **Memory formula (GPU):** `layers × rows × cols × data_size`
-> With 7 layers + float32: `7 × 20 × 20 × 4 B ≈ 112 KB` — negligible. For a 50 m map: `7 × 100 × 100 × 4 → ~28 MB`.
+> **GPU memory rough formula (float32):** `layers × rows × cols × 4 bytes`. With `7` base layers at 0.5 m / 10 m: `7 × 20 × 20 × 4 ≈ 112 KB` — tiny. The real cost is in temporary CUDA buffers for kernel launches (~tens of MB).
 
 ### 2. Sensor Noise & Point Filtering
 
-| Parameter | Default | Description |
+| Parameter | Default | Tuning Notes |
 |-----------|---------|-------------|
-| `sensor_noise_factor` | `0.05` | Weight inverse factor: noise ∝ `sensor_noise_factor × distance²`. Higher values = points receive lower confidence at range → noisier map but fewer false positives. For LiDAR use **smaller** (e.g., 0.01). For depth cameras, use similar to default. |
-| `mahalanobis_thresh` | `2.0` | Maximum Mahalanobis distance for a point to be considered valid. Points outside this threshold of any existing cell are marked as outliers. Lower = stricter (fewer points accepted). Higher = more lenient but riskier. |
-| `outlier_variance` | `0.01` | Variance value assigned to outlier cells. Low values effectively "hide" those cells. |
-| `min_valid_distance` | `0.2` m | Reject points closer than this to the sensor (eliminates robot-body self-reflections). For LiDAR on a rover, set ~**0.3–0.5 m**. |
-| `max_height_range` | `10.5` m | Maximum height above sensor before point rejection (prevents ceiling/floor detection for overhead mapping). |
+| `sensor_noise_factor` | `0.05` | Weight inversely ∝ sensor_noise × distance². **Higher → points accepted with lower confidence at long range.** For the Unitree L2 (solid-state LiDAR), drop to ~**0.01–0.02**. For RGB-D cameras keep closer to the default. |
+| `mahalanobis_thresh` | `2.0` | Max Mahalanobis distance from an existing cell's Gaussian before a point is rejected as an outlier. **Lower → stricter map, fewer points accepted.** Raise if you get too-few valid cells on rough terrain; lower for sharper walls and floors. |
+| `outlier_variance` | `0.01` | Variance pushed into a cell when the incoming point is flagged outlier. Low = effectively invisible. High = leaves "ghost" data behind. |
+| `min_valid_distance` | `0.2` m | Clamp near-range noise (robot body, chassis reflections). **Increase to 0.3–0.5** for rovers with dense LiDAR mounting on sloped bumpers. |
+| `max_height_range` | `10.5` m | Upper-bound height clip relative to sensor Z. Prevents ceilings from appearing when looking up. Only relevant if the mount is very close to the ground. |
 
-### 3. Ramped Height Rejection
+### 3. Ramped Height Rejection (Cone Filter)
 
-These three parameters define a dynamic vertical filter: reject points where  
-**z > max(d − ramped_height_range_b, 0) × ramped_height_range_a + ramped_height_range_c**
+These three values define a conical rejection zone around the sensor:
+> Reject points where `z > max(d - ramped_height_range_b, 0) × ramped_height_range_a + ramped_height_range_c`
 
-| Parameter | Default | Description |
-|-----------|---------|-------------|
-| `ramped_height_range_a` | `0.3` | Slope of rejection cone from sensor. Lower = narrower valid volume, more aggressive near-field filtering. |
-| `ramped_height_range_b` | `1.0` m | Distance offset. Controls how far in front the ramp starts sloping. |
-| `ramped_height_range_c` | `0.2` m | Minimum vertical height from sensor regardless of distance. Prevents near-field "wall" at base. |
+| Parameter | Default | Intuition |
+|-----------|---------|-----------|
+| `ramped_height_range_a` | `0.3` (dimensionless) | Slope of the upper rejection boundary — smaller = narrower cone (more aggressive near-field filtering). |
+| `ramped_height_range_b` | `1.0` m | Offset along distance. Controls how far in front of the sensor the ramp "starts". |
+| `ramped_height_range_c` | `0.2` m | Minimum absolute height from sensor regardless of range (clips floor directly underneath). |
 
-### 4. Drift Compensation (Critical for Nav2)
+> **Tune tip:** On a rover looking slightly downward, increase `ramped_height_range_b` so the rejection cone starts closer to the robot and avoids falsely marking ground under the chassis as "too high".
 
-Cumulative odometry drift corrupts map position over time. These parameters compensate:
+### 4. Drift Compensation ⚡
 
-| Parameter | Default | Description |
-|-----------|---------|-------------|
-| `enable_drift_compensation` | `true` | Toggles drift correction on/off. **Always keep on** for mobile robots. |
-| `position_noise_thresh` | `0.01` m | Drift compensation triggers only when odometry position change exceeds this. Prevents noise from being treated as drift. |
-| `orientation_noise_thresh` | `0.1` rad | Same but for orientation change. Keep low to avoid over-compensating during rapid turning. |
-| `drift_compensation_alpha` | `0.1` | Smoothing factor: smaller values = slower, smoother correction (less jarring map shifts). Larger = faster correction but potential jumps. |
-| `max_drift` | `0.1` m | Maximum allowable drift per update. Drift beyond this is **discarded for safety** — prevents catastrophic map corruption from bad sensor readings. |
-| `drift_compensation_variance_inlier` | `0.05` | Only cells with variance below this value are used as reference during compensation. Lower = more selective (fewer trusted cells). |
-| `traversability_inlier` | `0.9` | Minimum traversability score for a cell to be considered an inlier. Higher = only confident traversal areas contribute. |
-| `min_height_drift_cnt` | `100` | Minimum number of inlier cells required before drift compensation is triggered. Prevents spurious corrections from very few observations. |
+Cumulative odometry drift corrupts map pose over time. This subsystem *proactively* corrects the elevation layer when a large enough motion is detected:
 
-**How it works in practice:**
-1. The map checks if odometry has shifted beyond `position_noise_thresh` or `orientation_noise_thresh`.
-2. It finds "inlier" cells (low variance + high traversability).
-3. Computes the mean error between projected and observed elevations.
-4. If total drift < `max_drift`, **adds** a fraction of the correction (`alpha × mean_error`) to the elevation layer.
+| Parameter | Default | Effect of Changing |
+|-----------|---------|--------------------|
+| `enable_drift_compensation` | `true` | **Always keep true** on a moving rover. |
+| `position_noise_thresh` | `0.01` m | Minimum odometry displacement before compensation is *eligible*. Higher → more selective (won't trigger for tiny jitters). Lower → catches every micro-adjustment, but also more noise-driven corrections. |
+| `orientation_noise_thresh` | `0.1` rad (≈ 6°) | Same as above but for angular movement. Keep low to avoid over-correcting during tight turns where LiAD returns are unreliable. |
+| `drift_compensation_alpha` | `0.1` | Smoothing factor: `elevation_new = elevation + alpha × mean_error`. **Smaller → slower, gentler correction** (recommended 0.05–0.1). Larger → faster convergence but visible "hops" in the map. |
+| `max_drift` | `0.1` m | Safety cap — drift *above* this is discarded entirely. Prevents a single bad measurement from corrupting the whole map. |
+| `drift_compensation_variance_inlier` | `0.05` | Only cells with variance ≤ this are trusted as "fixed ground" for the error estimate. Higher → more cells included (more robust). Lower → only highest-confidence cells (less coverage, tighter correction). |
+| `traversability_inlier` | `0.9` | Minimum traversability score for an inlier cell. Higher = only truly flat areas contribute to drift estimate. Set lower (~0.5) if you need more reference cells on uneven terrain. |
+| `min_height_drift_cnt` | `100` | Minimum number of valid inliers before any correction occurs. Prevents single-cell corrections from "jumping" the map. Raise on sparse maps; reduce for very rich scans. |
 
-### 5. Variance & Time Management
+**Mechanism (what happens each pose update):**
+1. Compare the new odometry pose with the old one. If displacement < `position_noise_thresh` *and* rotation < `orientation_noise_thresh`, **skip compensation entirely**.
+2. Collect all "inlier" cells (variance ≤ `drift_compensation_variance_inlier` ∩ traversability ≥ `traversability_inlier`).
+3. Compute the mean elevation error between projected LiDAR measurements and existing cells → this is the estimated drift along the sensor's vertical axis.
+4. If total drift magnitude < `max_drift`, apply: `elevation += alpha × mean_error`. Cells outside the radius of validity are left alone to avoid "smearing" corrections across large unknown regions.
 
-| Parameter | Default | Description |
-|-----------|---------|-------------|
-| `initial_variance` | `1000.0` | Starting confidence (variance) for new map cells. Very high values = cells start very uncertain, allowing fast updates from incoming points. Higher = faster initial convergence but noisier early map. |
-| `initialized_variance` | `10.0` | Variance after the map is initialized (first initialization with point cloud). Lower = more confident initial model. |
-| `max_variance` | `100.0` | Maximum allowed variance per cell. Acts as a "forgetting cap" — prevents any cell from becoming too uncertain. |
-| `time_variance` | `0.0001` | Variance added to valid cells each `update_variance_fps`. Represents temporal uncertainty growth. Lower = older observations stay more confident (better for slow-moving robots). |
-| `time_interval` | `0.1` s | Interval at which the time layer increments by this amount. Tracks how "stale" each cell is. |
+### 5. Variance & Memory Management
 
-### 6. Map Update Rates
+| Parameter | Default | Notes |
+|-----------|---------|-------|
+| `initial_variance` | `1000.0` | Starting variance for brand-new cells. **Very high** values mean the cell is "open to persuasion" from every incoming point, which gives fast convergence but early-stage noise. Lower (e.g., 10) = more confident initial guess that resists later data changes. |
+| `initialized_variance` | `10.0` | Variance *after* map initialization runs (first point-cloud pass). Set lower if you want the initialized model to be authoritative over subsequent noisy data. |
+| `max_variance` | `100.0` | Hard cap per cell. Acts as a "forgetting ceiling" — older unobserved cells still gain variance via `time_variance` but never exceed this value. Higher = more conservative map (less update speed). Lower = cells age out faster, potentially losing valid data under the robot. |
+| `time_interval` | `0.1` s | Interval at which each cell's time-layer is incremented. Tracks "staleness". Used downstream to age out stale observations via `time_variance`. |
+| `update_variance_fps` | `2.0` Hz | How often temporal variance (`time_variance`) is applied. Non-critical — lower saves GPU cycles; higher keeps aging more accurate for fast-moving maps. |
 
-| Parameter | Default | Description |
-|-----------|---------|-------------|
-| `update_pose_fps` | `60.0` Hz | Rate at which pose updates and map shifting occur. Should match or exceed your odometry/tf broadcast rate (20+ Hz recommended). |
-| `update_variance_fps` | `2.0` Hz | Rate for applying temporal variance growth. Not time-critical; lower rates save GPU compute. |
-| `map_acquire_fps` | `5.0` Hz | Rate at which map data is copied from GPU → CPU for publishing. Should be **lower** than all update rates. Higher = smoother visualization but more CPU/GPU bandwidth. |
+### 6. Map Update Rates (Scheduling)
 
-### 7. Traversability & Obstacle Detection
+| Parameter | Default | Recommended Range |
+|-----------|---------|-------------------|
+| `update_pose_fps` | `60.0` Hz | Match or **exceed** your odometry/tf broadcast rate (20+ is fine; 60 is overkill but safe). Determines how often the map tracks new pose estimates and shifts centre. Keep high if odometry jitter is present — more frequent re-centring = less clipping at map edges. |
+| `update_variance_fps` | `2.0` Hz | Low enough to be cheap (non-critical compute), high enough that aging doesn't overshoot between ticks. 1–5 Hz works for most rovers. |
+| `map_acquire_fps` | `5.0` Hz | Rate of GPU → CPU map copy for publishing `/elevation_map_raw`. Must be **strictly lower** than all update rates. For real-time RViz, 3–8 Hz is fine. Higher = smoother graphics but more bandwidth overhead. |
 
-Used by the neural network traversability filter and Nav2 costmap conversion:
+### 7. Traversability Thresholds (Nav2 Integration)
 
-| Parameter | Default | Description |
-|-----------|---------|-------------|
-| `dilation_size` | `3` | Kernel size (pixels) for dilating valid cells before traversability filtering. Larger = more context per cell, less "noise" in the output. |
-| `safe_thresh` | `0.7` | If a cell's traversability drops below this threshold, it counts as **unsafe** for polygon traversal checks. |
-| `safe_min_thresh` | `0.4` | Hard minimum: any single cell below this score makes the entire polygon unsafe (regardless of average). |
-| `max_unsafe_n` | `10` | If more than this many cells in a polygon are unsafe, the polygon is rejected. Tolerance for small obstacles within an otherwise traversable area. |
+Used by the traversability filter neural network and downstream Nav2 costmap thresholds:
 
-### 8. Wall Sharpening & Cleanup
+| Parameter | Default | Impact |
+|-----------|---------|--------|
+| `dilation_size` | `3` | Dilation kernel size before the NN filter runs. Larger = more context per cell, fewer "salt-and-pepper" false obstacles. On a 0.5 m map with 20×20 resolution, each pixel spans large terrain patches — 3 is adequate; go up to 5 only for very smooth floors. |
+| `safe_thresh` | `0.7` | Traversability below this counts as **unsafe** during polygon traversability checks. Affects Nav2's obstacle costmap (`costmap_converter` threshold of 0.3 maps directly here — anything with a traversability score < 0.3 is treated as an occupied cell at value 100). |
+| `safe_min_thresh` | `0.4` | **Absolute floor** — any single cell below this kills the entire polygon regardless of its average traversability. Tighten to 0.5 if you want Nav2 to avoid even marginal terrain. |
+| `max_unsafe_n` | `10` | Tolerance for small obstacles within an otherwise-safe polygon. If more than 10 *unsafe cells* fall inside a proposed route segment, reject the whole thing. Raise (e.g., 20) on rough terrain where Nav2 can plausibly cross; lower (e.g., 5) if you want conservative routing. |
 
-For producing clean edge detection (vertical walls vs. ground):
+### 8. Wall Sharpen & Visibility Cleanup
 
-| Parameter | Default | Description |
-|-----------|---------|-------------|
-| `enable_edge_sharpen` | `true` | Enables wall_num_thresh logic: when a cell has more points than the threshold, only points **above** current height are used — making vertical surfaces crisper. |
-| `wall_num_thresh` | `20` | Minimum point count in a cell before edge sharpening is activated per that cell. Lower = sharper walls with fewer observations (noisier). Higher = wait for more data. |
-| `enable_visibility_cleanup` | `true` | Removes invalid cells behind obstacles using ray tracing from sensor to valid cells. Prevents "ghost" terrain behind walls. |
-| `cleanup_step` | `0.1` | Amount subtracted from validity layer during cleanup per iteration. Higher = faster cleanup but may eat into real data. |
-| `cleanup_cos_thresh` | `0.1` | Cosine threshold between ray direction and vertical axis for visibility checks. Lower = stricter angle requirement (fewer points cleaned). |
+| Parameter | Default | Effect |
+|-----------|---------|--------|
+| `enable_edge_sharpen` | `true` | When ≥ `wall_num_thresh` points fall into a cell, only points **above** the current height are kept → makes walls and steps crisp. Keep true for rover terrain with curbs/boxes/etc. Flip off on very flat warehouse floors. |
+| `wall_num_thresh` | `20` | Minimum points-per-cell to activate sharpening per cell. Lower = crisper edges with fewer observations but also more noise (each stray point can flip a cell). Raise on noisy sensors (e.g., 40–50 for high-density LiDAR). |
+| `enable_visibility_cleanup` | `true` | Removes "behind-obstacle" ghosts using ray-tracing from sensor through valid cells into empty space. Keeps the map honest under shelves/underpasses. Disable if you experience excessive data loss behind dense structures. |
+| `cleanup_step` | `0.1` | Validity-subtraction per cleanup iteration. Higher = faster erosion of ghost cells (fewer iterations needed) but more aggressive — risk of deleting real terrain near obstacles. 0.05–0.1 is safe for ground mapping. |
+| `cleanup_cos_thresh` | `0.1` | Cosine threshold on ray direction vs. vertical axis; controls the cone of visibility. Lower = tighter cone (more points rejected as "looking off-angle"). Keep default unless you have a wide-cone sensor like a camera or RGB-D unit. |
 
 ### 9. Overlap Clearance (Multi-Floor)
 
-For robots that move between floors/levels:
+For robots that encounter elevated surfaces (shelves, ramps):
 
-| Parameter | Default | Description |
-|-----------|---------|-------------|
-| `enable_overlap_clearance` | `true` | Clears cells near the robot center that don't match expected height range (prevents old floor layers from corrupting new ones). |
-| `overlap_clear_range_xy` | `4.0` m | XY radius around map center where clearance is active. Cells outside this ring are never cleared in one pass. Larger = safer but slightly slower. |
-| `overlap_clear_range_z` | `2.0` m | Vertical range from current center-Z. Only cells within ±Z of map center can be cleared. Prevents accidental deletion of far terrain. |
+| Parameter | Default | Notes |
+|-----------|---------|-------|
+| `enable_overlap_clearance` | `true` | Clears cells near map centre that exceed ±`overlap_clear_range_z` from expected floor height, preventing lower-floor ghosts above the robot. On single-floor operation this is mostly harmless; keep true. |
+| `overlap_clear_range_xy` | `4.0` m | XY ring radius where clearance can fire. Cells outside are never cleared in any pass — prevents the ring-edge effect (half a map wiped during clearance). Larger = safer but slightly slower per frame. 4–6 m works for typical rovers. |
+| `overlap_clear_range_z` | `2.0` m | Z-range from centre used to identify "suspicious" cells. Raise to ~3-4 m if you have tall objects (pallet racks, etc.) that span the full clearance window and get erroneously wiped. |
 
-### 10. Topology & Frame Configuration
+### 10. Frame / TF Configuration
 
-| Parameter | Default | Description |
-|-----------|---------|-------------|
-| `map_frame` | `'map'` | Global reference frame the map sits in. Nav2 expects **`/map`**. |
-| `base_frame` | `'base_link'` | Robot base — the map center follows this frame in the odometry chain. Must match your robot description TF tree. |
-| `corrected_map_frame` | `'map'` | Frame where drift-compensated map TF is published. Usually same as `map_frame`. |
+| Parameter | Default | Notes |
+|-----------|---------|-------|
+| `map_frame` | `'map'` | Nav2's global frame — **must** be `/map`. Changing it requires updating Nav2 `global_frame` parameter and all costmap layers. |
+| `base_frame` | `'base_link'` | Frame the map center orbits (the robot body). Must exist in your TF tree and match your URDF/SRDF base link name. |
+| `corrected_map_frame` | `'map'` | Drift-corrected transform published as `/corrected_map_frame`. For most rover setups this is identical to `map_frame`; only differ if you use a separate drift-compensated localization system (e.g., LiDAR odometry + map matching). |
 
-### 11. Feature Toggles (Performance Settings)
+### 11. Feature Toggles
 
-| Parameter | Default | Description |
-|-----------|---------|-------------|
-| `enable_normal_arrow_publishing` | `false` | Publish normals as RViz visualization markers. Turn on for debugging surface orientation. Off by default — saves compute/bandwidth. |
-| `enable_drift_corrected_TF_publishing` | `true` | Publish TF `/map → /robot_base_drift_corrected`. Useful when Nav2 uses the corrected frame for localization. |
-| `enable_normal_color` | `false` | Include surface normals as a "color" layer in the map output. Enable if you want 3D visualization with shading. |
+| Parameter | Default | Purpose |
+|-----------|---------|---------|
+| `enable_normal_arrow_publishing` | `false` | Surface normal arrows as RViz markers. Turn **on** for debugging surface tilt; off by default to save bandwidth. |
+| `enable_drift_corrected_TF_publishing` | `true` | Publishes TF from corrected map origin. Useful if Nav2 uses this corrected frame as its global reference instead of the odometry-derived `/map`. |
+| `enable_normal_color` | `false` | Includes surface normals as a "color" layer in published maps. Enables 3D shading in visualisers like CloudCompare or RTAB-Map. Leave off unless you're debugging terrain normals. |
 
 ### 12. Map Initialization
 
-Controls how the map is seeded on first point cloud receipt:
-
-| Parameter | Default | Description |
-|-----------|---------|-------------|
-| `initialize_method` | `'linear'` | Interpolation: `'nearest'`, `'linear'`, or `'cubic'`. Cubic = smoothest but slowest. Linear = good balance for rovers. |
-| `initialize_frame_id` | `['base_link']` | TF frame at which to initialize. Each value creates a square map section centered on that frame's current pose. Multiple frames allow multi-region initialization (e.g., floor + table top). |
-| `dilation_size_initialize` | `2` | Dilation kernel size applied after initialization (smoothes rough initial data). Higher = smoother but may erase small features. |
-| `use_initializer_at_start` | `true` | Initialize map immediately on first point cloud, or wait for `/initialize_map` service call. Set to **false** if you want to start empty and seed manually via RViz "2D Nav Goal" → "Publish Initial Pose". |
+| Parameter | Default | Intuition |
+|-----------|---------|-----------|
+| `initialize_method` | `'linear'` | Interpolation for the first point-cloud seeding pass. `'cubic'` is smoothest but slow; `'nearest'` is fastest but blocky; `'linear'` (default) is a balanced sweet-spot for rover ground maps. |
+| `initialize_frame_id` | `['base_link']` | TF frame used to seed the initial map section. Every entry creates one square centred on that frame. Use multiple entries (`[base_link, front_laser]`) to pre-seed terrain from several known sensor viewpoints. |
+| `dilation_size_initialize` | `2` post-init smoothing kernel. Higher → smoother initial model at the cost of erasing small features (e.g., ground seams, minor curbs). 2-3 is adequate for most floor surfaces. |
+| `use_initializer_at_start` | `true` | Auto-seed on first point cloud received. Set to **false** if you instead seed manually via RViz "2D Nav Goal → Publish Initial Pose" or programmatically calling `/initialize_map`. |
 
 ---
 
-## 🗺️ Plugin Layers (Map Post-Processing)
+## 🗺️ Plugin Layers (Post-Processing Pipeline)
 
-Defined in `config/core/plugin_config.yaml`. These run sequentially on the raw map before publishing:
+Plugins run sequentially in `config/core/plugin_config.yaml` **after** sensor fusion but **before** publishing:
 
 ```
-Raw Map ──→ min_filter ──→ smooth ──→ inpaint ──→ (traversability erosion) ──→ Published Layers
+Raw GPU Map  →  min_filter  →  smooth  →  inpaint  →  erosion  →  Published grid layers
 ```
 
-| Plugin | Function | Key Parameters |
-|--------|----------|----------------|
-| `min_filter` | Fills invalid cells with minimum neighboring height | `dilation_size`, `iteration_n` |
-| `smooth_filter` | Gaussian-like smoothing of elevation layer | `input_layer_name: min_filter` (processes previous output) |
-| `inpainting` | OpenCV inpainting (telea/Navier-Stokes) for gaps | `method: telea \| ns` |
-| `erosion` | Dilates/dilates traversability to clean edges | `input_layer_name`, `dilation_size`, `iteration_n` |
+| Plugin | Function | Key Params |
+|--------|----------|------------|
+| `min_filter` | Fill invalid/nan cells with the **minimum** height in the dilation radius neighbourhood. Acts as a first-pass gap filler. | `dilation_size`, `iteration_n` |
+| `smooth_filter` | Simple smoothing (averaging) over the previous layer (`input_layer_name`). Reduces surface noise produced by point clouds with high variance. | — |
+| `inpainting` | OpenCV inpainting of remaining nan regions using either the `telea` or `ns` (Navier-Stokes) algorithm. Produces visually clean edges but adds CPU overhead. | `method: telea\|ns` |
+| `erosion` | Dilates traversability (or any selected layer) to smooth out small "islands" of unsafe value and widen safe corridors by the specified radius. Set `reverse=true` for a **closing** operation that shrinks traversable regions; use `false` for **opening** (expands them). | `dilation_size`, `iteration_n` |
 
 ---
 
-## 📡 Topics & Services Summary
+## 📡 Key ROS2 Topics & Services
 
-### Key Topics
-
-| Topic | Direction | Type | Purpose |
-|-------|-----------|------|---------|
-| `/elevation_mapping_node/elevation_map_raw` | Out (GridMap) | `grid_map_msgs/` | Raw unfiltered map (publisher: elevation_map_raw) |
-| `/map` | Out (OccupancyGrid) | `nav_msgs/OccupancyGrid` | Nav2-compatible costmap (from costmap_converter, 30% threshold) |
-| `/odom/wheel` | Out (Odometry) | `nav_msgs/Odometry` | Wheel odometry (odometry package) |
-| `/encoder_data` | Out | `rover_msgs/EncoderMsg` | Raw wheel speeds → encoder node |
-| `/joystick_cmd` | In | `rover_msgs/ControllerMsg` | Joystick command → motor controller |
-| `/marker_pose` | Out (PoseStamped) | `geometry_msgs/PoseStamped` | ArUco marker pose in map frame |
+| Topic / Service | Direction | Type | Purpose |
+|-----------------|-----------|------|---------|
+| `/point_cloud` | In | `sensor_msgs/PointCloud2` | Raw sensor data from the Unitree L2 (or any compatible source) subscribed by the elevation map node. |
+| `/elevation_mapping_node/elevation_map_raw` | Out | `grid_map_msgs/GridMap` | Raw GPU map layers — unfiltered, published at 5 Hz. |
+| `/map` | Out | `nav_msgs/OccupancyGrid` | Costmap for Nav2 (30% traversability threshold maps below that to obstacle=value 100). Publishes transiently/local at QoS(1) so nav stack re-subscribes on connection and retains the latest published map. |
+| `/odom/wheel` | Out | `nav_msgs/Odometry` | Wheel odometry (published by the odometry package from encoder readings + IMU quaternions). |
+| `/encoder_data` | Out | `rover_msgs/EncoderMsg` | Raw left-right / front-rear encoder speeds (60 Hz) read over serial and published by **motor_kontrol**. Feeds into odometry. |
+| `/joystick_cmd` | In | `rover_msgs/ControllerMsg` | Joystick commands from the RC receiver (**uzaktan_kumanda**) → forwarded to motor controller for manual driving. |
 
 ---
 
-## 🔍 Tuning Tips
+## 🔧 Nav2 Integration — Quick Reference
 
-1. **For noisy sensors** → Increase `sensor_noise_factor`, raise `mahalanobis_thresh`
-2. **For fast-moving robots** → Keep `drift_compensation_alpha` small (e.g., 0.05) to avoid jumpy corrections
-3. **For low-light indoor environments** → Decrease `ramped_height_range_a` to tighten the valid cone below and above the sensor
-4. **If Nav2 costmap looks noisy** → Adjust your `costmap_converter` threshold (`val < 0.3f = obstacle`) or increase `dilation_size` in plugins
-5. **Memory concerns** → Larger `map_length` with small `resolution` grows quadratically. A 40 m map at 0.1 m resolution = ~400×400 × 7 × 4 bytes ≈ **45 MB on GPU**
+[Nav2](https://navigation.ros.org/) is the standard ROS2 navigation stack providing global/local path planning, obstacle avoidance, and recovery behaviours on top of the costmap produced by `costmap_converter`.
+
+### Pipeline Overview
+
+1. **`/map` (OccupancyGrid):** Published by your `costmap_converter` node from traversability data — Nav2 reads this as its static map layer.
+2. **`/odom/wheel`:** Odometry feed for localisation within the map + robot-motion estimation during trajectory execution.
+3. **`/cmd_vel`:** Nav2's output velocity commands forwarded to your rover's low-level controller.
+
+### Typical Nav2 Parameter Files
+
+Nav2 expects a set of YAML parameter files that define controllers, planners, costmaps, and behaviours. Your stack uses:
+
+| Component | Nav2 Package | Key File / Namespace |
+|-----------|-------------|---------------------|
+| AMCL (localiser) | `nav2_amcl` | Parameters under `amcl` namespace — configure `odom_frame_id`, `map_frame_id`, `base_frame_id`, and initial pose estimate. |
+| NavFn / DWB planner | `nav2_navfn_planner`, `nav2_dwb_local_planner` | Global path planning uses `nav_core2::NavFn`, local tracking with `dwb_controller::DWBLocalPlanner`. Tune the controller's `min_x_vel_bytes`, `max_x_vel_bytes`, and acceleration limits to your rover's dynamics. |
+| Costmap layer | `nav2_costmap_2d` | The nav2_costmap node subscribes `/map` + `/odom/wheel` → produces a dynamic footprint-aware costmap for local navigation. The **Global costmap** reads from the static map; the **Local costmap** fuses sensor data and obstacle avoidance data dynamically at runtime. |
+| Recovery & BT tree | `nav2_behaviors`, `behavior_tree/` | Recovery behaviours (e.g., spin, retract) and navigation behaviour trees define what happens when path planning fails or a localisation issue is detected. |
+
+### Launching Nav2 with Your Stack
+
+```bash
+# 1. Ensure costmap_converter + odometry are running (see Running on a Real Rover above).
+
+# 2. Launch Nav2 bringup (adapt to your robot's type — here we show the standard nav2_bringup):
+ros2 launch nav2_bringup navigation_launch.py
+
+# 3. RViz for visualisation:
+rviz2 ...   # Add plugins: NavPose, TF, Map (subscribe to /map), Path, LaserScan
+```
+
+### Common Tuning Points in Your Set-Up
+
+| Issue | Likely Cause | Fix |
+|-------|-------------|-----|
+| Nav2 sees the entire map as obstacles | `costmap_converter` threshold too low (`val < 0.3`). **Lower threshold** (e.g., `0.15`) if traversability scores are generally high, or increase them in the elevation map's traversability parameters so more cells become "safe" for Nav2 to traverse. |
+| Path planning takes huge detours around your own shape | The robot footprint / costmap inflation radius doesn't account for your rover's size. Set `inflation_radius` and `cost_scaling_factor` in the param file to match your vehicle dimensions. |
+| Robot "drifts" from planned path | Wheel odometry error or LiDAR sensor noise causing inaccurate localisation. Tune AMCL's `resample_interval` and `initial_pose_*`; for the costmap, check that `resolution` (0.5 m in your config) gives enough cells to distinguish narrow obstacles. |
+| Nav2 gets stuck behind curbs/steps | Traversability threshold + robot height limits. If your rover can't climb >~5 cm curbs but the costmap marks them as safe, lower the traversability cutoff or add a `max_z` check in the map's layer configuration so that elevated regions are treated as obstacles rather than traversable terrain. |
+
+### Nav2 + `corrected_map_frame`
+
+If you enable `enable_drift_corrected_TF_publishing`, Nav2 can optionally use the corrected frame for its global reference. Set `global_frame: <corrected_frame_name>` and `map_frame: <corrected_frame_name>` in your navigation params so that the localiser doesn't drift away from the costmap as odometry degrades over time.
+
+---
+
+## 🔍 Tuning Quick-Reference
+
+| Condition | Parameter to Adjust | Direction |
+|-----------|-------------------|-----------|
+| Noisy / sparse sensor data | `sensor_noise_factor`, `mahalanobis_thresh` | ↑ both for stricter filtering |
+| Fast-moving rover, map "jumps" | `drift_compensation_alpha` | ↓ (e.g. 0.05) |
+| Near-field floor reflected by LiDAR under chassis | `ramped_height_range_b`, `min_valid_distance` | ↑ |
+| Nav2 costmap looks too noisy | Traverseability threshold in **costmap_converter** (`val < 0.3f → obstacle`) — increase the cutoff to e.g. `0.45`, or adjust `dilation_size` / plugin layers upstream | |
+| Map grows large during multi-floor operation | `enable_overlap_clearance`, `overlap_clear_range_*` | ↑ ranges if floors are far apart |
+
+---
+
+## 📝 Notes on the `motor_kontrol` Module
+
+```
+Package                  Node                     Topic In           →  Topic Out / Hardware
+----------------------------------------------|--------------------------|---------------------------
+motor_kontrol            motor    (joystick_cmd       →   encoder_data    serial writes (STM32)
+                         robot_kol  joystick_cmd      →   [serial port]   (robot-arm servos)
+                         uzaktan_ RC receiver           →   joystick_cmd    (RC transmitter raw data)
+```
+
+All three nodes use `MultiThreadedExecutor` to prevent the joystick subscriber callback from starving the timer-based encoder reading — critical for avoiding stutter in real-time motor commands.
+
